@@ -1,0 +1,40 @@
+name: Telegram Bot
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # يُعيد التشغيل كل 6 ساعات تلقائياً
+    - cron: '0 */6 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          BOT_TOKEN:      ${{ secrets.BOT_TOKEN }}
+          API_ID:         ${{ secrets.API_ID }}
+          API_HASH:       ${{ secrets.API_HASH }}
+          OWNER_ID:       ${{ secrets.OWNER_ID }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: python main.py
