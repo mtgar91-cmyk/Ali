@@ -1,0 +1,5 @@
+Telethon==1.36.0
+TgCrypto~=1.2.5
+py-tgcalls~=2.2.11
+aiohttp
+aiofiles
