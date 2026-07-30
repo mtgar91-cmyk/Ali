@@ -8,6 +8,11 @@ on:
     # يُعيد التشغيل كل 6 ساعات تلقائياً
     - cron: '0 */6 * * *'
 
+# يوقف الـ run القديم تلقائياً عند بدء run جديد — يمنع AuthKeyDuplicatedError
+concurrency:
+  group: run-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
