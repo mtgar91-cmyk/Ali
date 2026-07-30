@@ -46,10 +46,11 @@ BOT_TOKEN      = os.getenv("BOT_TOKEN", "")
 OWNER_ID       = int(os.getenv("OWNER_ID", "0"))
 SESSION_STRING = os.getenv("SESSION_STRING", "")
 
-SESSIONS_DIR = "sessions"
-MEDIA_DIR    = "media_files"
-USER_SESSION = os.path.join(SESSIONS_DIR, "user")
-CONFIG_FILE  = "config.json"
+SESSIONS_DIR         = "sessions"
+MEDIA_DIR            = "media_files"
+USER_SESSION         = os.path.join(SESSIONS_DIR, "user")
+SESSION_STRING_FILE  = os.path.join(SESSIONS_DIR, "session_string.txt")
+CONFIG_FILE          = "config.json"
 
 for _d in [SESSIONS_DIR, MEDIA_DIR]:
     os.makedirs(_d, exist_ok=True)
@@ -80,11 +81,13 @@ if "yoot_group" not in cfg:
 # ─────────────────────────────────────────────────────────────
 # الحالات والكاش
 # ─────────────────────────────────────────────────────────────
-bot_states   = {}   # حالات واجهة البوت
-ub_states    = {}   # حالات اليوزربوت متعددة الخطوات
-file_cache   = {}   # كاش الملفات
-active_chats = {}   # مكالمات الاستيج النشطة {chat_id: PyTgCalls}
-yoot_pending = {}   # انتظار رد بوت البصمات {yoot_msg_id: (src_chat_id, event)}
+bot_states      = {}    # حالات واجهة البوت
+ub_states       = {}    # حالات اليوزربوت متعددة الخطوات
+file_cache      = {}    # كاش الملفات
+active_chats    = {}    # مكالمات الاستيج النشطة {chat_id: PyTgCalls}
+yoot_pending    = {}    # انتظار رد بوت البصمات {yoot_msg_id: (src_chat_id, event)}
+locked_chats    = set() # معرفات الدردشات الخاصة المقفلة (سيُحذف ما يكتبه الطرف الآخر)
+muted_users_pm  = set() # معرفات المستخدمين المكتومين في الخاص (سيُحذف ما يكتبونه)
 
 CHUNK_SIZE  = 1 << 20  # 1MB
 NUM_WORKERS = 4
@@ -100,13 +103,35 @@ call_manager: "PyTgCalls | None" = None
 
 
 def _make_user_client() -> TelegramClient | None:
-    if SESSION_STRING:
-        return TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH,
+    # أولاً: نحاول من متغير البيئة
+    ss = SESSION_STRING
+    # ثانياً: إذا لم يوجد في البيئة نحاول من الملف المحفوظ
+    if not ss and os.path.exists(SESSION_STRING_FILE):
+        try:
+            with open(SESSION_STRING_FILE, encoding="utf-8") as f:
+                ss = f.read().strip()
+        except Exception:
+            pass
+    if ss:
+        return TelegramClient(StringSession(ss), API_ID, API_HASH,
                               flood_sleep_threshold=60)
     if os.path.exists(USER_SESSION + ".session"):
         return TelegramClient(USER_SESSION, API_ID, API_HASH,
                               flood_sleep_threshold=60)
     return None
+
+
+def _save_session_string(client: TelegramClient):
+    """حفظ نص الجلسة في ملف محلي لضمان الاستمرارية بعد إعادة التشغيل."""
+    try:
+        ss = client.session.save()
+        if ss:
+            os.makedirs(SESSIONS_DIR, exist_ok=True)
+            with open(SESSION_STRING_FILE, "w", encoding="utf-8") as f:
+                f.write(ss)
+            logger.info("✅ تم حفظ نص الجلسة في الملف المحلي")
+    except Exception as e:
+        logger.warning(f"تعذّر حفظ نص الجلسة: {e}")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -566,6 +591,8 @@ async def _finish_session_gen(event, tmp: TelegramClient, phone: str):
     call_manager = None
     user_client = TelegramClient(StringSession(sess_str), API_ID, API_HASH)
     await user_client.connect()
+    # حفظ نص الجلسة محلياً حتى لا يحتاج لإعادة التسجيل بعد كل إعادة تشغيل
+    _save_session_string(user_client)
     _register_ub_handlers()
     bot_states.pop(event.sender_id, None)
     await event.respond(
@@ -609,11 +636,19 @@ def _register_ub_handlers():
         elif txt == "ضف صورة":
             await _cmd_add_photo(event)
 
-        # ── قفل الدردشة (أرشفة) ──
+        # ── قفل الدردشة (حذف رسائل الطرف الآخر في الخاص) ──
+        elif txt == "قفل الدردشة":
+            await _cmd_lock_dm(event)
+
+        # ── فتح الدردشة (إلغاء الحذف التلقائي) ──
+        elif txt == "فتح الدردشة":
+            await _cmd_unlock_dm(event)
+
+        # ── قفل (أرشفة) ──
         elif txt == "قفل":
             await _cmd_lock_chat(event)
 
-        # ── فتح الدردشة (إلغاء الأرشفة) ──
+        # ── فتح (إلغاء الأرشفة) ──
         elif txt == "فتح":
             await _cmd_unlock_chat(event)
 
@@ -628,6 +663,10 @@ def _register_ub_handlers():
         # ── كتم ──
         elif txt == "كتم" or txt.startswith("كتم "):
             await _cmd_mute(event, txt)
+
+        # ── الغاء كتم (في الخاص) ──
+        elif txt == "الغاء كتم" or txt.startswith("الغاء كتم "):
+            await _cmd_cancel_mute_pm(event, txt)
 
         # ── فك كتم ──
         elif txt == "فك كتم" or txt.startswith("فك كتم "):
@@ -829,6 +868,27 @@ def _register_ub_handlers():
         if (getattr(sender, "username", "") or "").lower() != "w60ybot":
             return
         await _handle_w60y_msg(event.message)
+
+    # ── مستمع الحذف التلقائي (قفل الدردشة / كتم في الخاص) ──
+    @user_client.on(events.NewMessage(incoming=True))
+    async def _auto_delete_handler(event):
+        if not event.is_private:
+            return
+        chat_id   = event.chat_id
+        sender_id = event.sender_id
+        # إذا كانت الدردشة مقفلة → احذف أي رسالة من الطرف الآخر
+        if chat_id in locked_chats:
+            try:
+                await event.delete()
+            except Exception:
+                pass
+            return
+        # إذا كان المستخدم مكتوماً → احذف رسائله في أي خاص
+        if sender_id in muted_users_pm:
+            try:
+                await event.delete()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1072,11 +1132,12 @@ async def _cmd_imitate(event, txt: str):
     mode = parts[1] if len(parts) > 1 and parts[1] in ("صور", "بايو", "اسم") else "الكل"
 
     target_id = await _resolve_target(event, txt)
-    await event.delete()
+    # لا نحذف رسالة الأمر — نرد عليها مباشرة
     if not target_id:
         return await _ub_reply(event, "⚠️ رُدّ على مستخدم أو اكتب @يوزر / ايدي.")
 
-    sm = await user_client.send_message(chat_id, f"⬇️ جاري تقليد الحساب…\n[{_bar(0)}] 0%")
+    sm = await user_client.send_message(chat_id, f"⬇️ جاري تقليد الحساب…\n[{_bar(0)}] 0%",
+                                        reply_to=event.id)
 
     # شريط تقدم وهمي
     async def fake_progress():
@@ -1152,6 +1213,13 @@ async def _cmd_mute(event, txt: str):
     await event.delete()
     if not target_id:
         return await _ub_reply(event, "⚠️ حدد المستخدم (رداً أو @يوزر أو ايدي).")
+    # في الخاص: كتم محلي — سيُحذف كل ما يكتبه هذا المستخدم تلقائياً
+    if event.is_private:
+        muted_users_pm.add(target_id)
+        return await _ub_reply(event,
+            "🔇 تم كتمه في الخاص.\nسيُحذف كل ما يكتبه تلقائياً.\n"
+            "اكتب «الغاء كتم» رداً عليه أو في خاصه لإلغاء الكتم.", delay=5)
+    # في المجموعة: كتم عبر صلاحيات الإدارة
     try:
         await user_client(functions.channels.EditBannedRequest(
             channel=chat_id,
@@ -1181,6 +1249,11 @@ async def _cmd_unmute(event, txt: str):
     await event.delete()
     if not target_id:
         return await _ub_reply(event, "⚠️ حدد المستخدم.")
+    # في الخاص: إزالة الكتم المحلي
+    if event.is_private:
+        muted_users_pm.discard(target_id)
+        return await _ub_reply(event, "🔊 تم فك الكتم في الخاص.", delay=4)
+    # في المجموعة: رفع القيود عبر صلاحيات الإدارة
     try:
         await user_client(functions.channels.EditBannedRequest(
             channel=chat_id,
@@ -1192,6 +1265,38 @@ async def _cmd_unmute(event, txt: str):
         await _ub_reply(event, "❌ أنت لست مشرفاً.")
     except Exception as e:
         await _ub_reply(event, f"❌ فشل: {e}")
+
+
+# ── الغاء كتم (في الخاص) ──
+async def _cmd_cancel_mute_pm(event, txt: str):
+    target_id = await _resolve_target(event, txt)
+    await event.delete()
+    if not target_id:
+        return await _ub_reply(event, "⚠️ رُدّ على رسالة المستخدم أو اكتب ايديه.")
+    muted_users_pm.discard(target_id)
+    await _ub_reply(event, "🔊 تم إلغاء الكتم.", delay=4)
+
+
+# ── قفل الدردشة (حذف رسائل الطرف الآخر في الخاص) ──
+async def _cmd_lock_dm(event):
+    chat_id = event.chat_id
+    await event.delete()
+    if not event.is_private:
+        return await _ub_reply(event, "⚠️ هذا الأمر للدردشات الخاصة فقط.")
+    locked_chats.add(chat_id)
+    await _ub_reply(event,
+        "🔒 تم قفل الدردشة.\nسيُحذف كل ما يكتبه الطرف الآخر تلقائياً.\n"
+        "اكتب «فتح الدردشة» لإلغاء القفل.", delay=5)
+
+
+# ── فتح الدردشة (إلغاء الحذف التلقائي) ──
+async def _cmd_unlock_dm(event):
+    chat_id = event.chat_id
+    await event.delete()
+    if not event.is_private:
+        return await _ub_reply(event, "⚠️ هذا الأمر للدردشات الخاصة فقط.")
+    locked_chats.discard(chat_id)
+    await _ub_reply(event, "🔓 تم فتح الدردشة.", delay=4)
 
 
 # ── حظر ──
@@ -1287,18 +1392,20 @@ async def _cmd_info(event, txt: str):
         await sm.edit(f"❌ فشل: {e}")
 
 
-# ── تحويل (re-send بدون هيدر التمرير) ──
+# ── تحويل (إلى الرسائل المحفوظة / الحافظة) ──
 async def _cmd_forward_media(event):
     replied = await event.get_reply_message()
     await event.delete()
     if not replied:
         return await _ub_reply(event, "⚠️ رُدّ على رسالة/ميديا لتحويلها.")
     try:
+        me = await user_client.get_me()
+        saved = me.id  # الرسائل المحفوظة
         if replied.media:
             caption = replied.text or ""
-            await user_client.send_file(event.chat_id, replied.media, caption=caption)
+            await user_client.send_file(saved, replied.media, caption=caption)
         elif replied.text:
-            await user_client.send_message(event.chat_id, replied.text)
+            await user_client.send_message(saved, replied.text)
     except Exception as e:
         await _ub_reply(event, f"❌ فشل التحويل: {e}")
 
@@ -1494,6 +1601,8 @@ async def main():
             await user_client.start()
             me = await user_client.get_me()
             logger.info(f"✅ اليوزربوت: {me.first_name} ({me.id})")
+            # حفظ نص الجلسة بعد كل بدء تشغيل لتجنب طلب إعادة التسجيل
+            _save_session_string(user_client)
             _register_ub_handlers()
             if CALLS_AVAILABLE:
                 call_manager = PyTgCalls(user_client)
