@@ -3,14 +3,17 @@
 """
 
 import os
+import re
 import json
 import time
 import logging
 import asyncio
+import tempfile
 import aiofiles
 
 from telethon import TelegramClient, events, Button, functions, types, utils
 from telethon.sessions import StringSession
+from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeFilename
 from telethon.errors import (
     SessionPasswordNeededError,
     PhoneCodeInvalidError,
@@ -674,51 +677,158 @@ def _register_ub_handlers():
                 if st and st.get("waiting_link"):
                     await _cmd_play_pm_with_link(event, txt, st)
 
-    # مستمع رد @W60yBot لأمر يوت / اريد
+    # ── دوال مساعدة لمطابقة البصمة ──
+    def _is_audio_msg(msg):
+        if getattr(msg, "audio", None) or getattr(msg, "voice", None):
+            return True
+        if not msg.document:
+            return False
+        for attr in msg.document.attributes:
+            if hasattr(attr, "title") or hasattr(attr, "performer"):
+                return True
+        mime = getattr(msg.document, "mime_type", "") or ""
+        return mime.startswith("audio/")
+
+    def _audio_text(msg):
+        parts = []
+        if msg.document:
+            for attr in msg.document.attributes:
+                if isinstance(attr, DocumentAttributeAudio):
+                    if getattr(attr, "title", None):     parts.append(attr.title)
+                    if getattr(attr, "performer", None): parts.append(attr.performer)
+                elif isinstance(attr, DocumentAttributeFilename):
+                    if getattr(attr, "file_name", None): parts.append(attr.file_name)
+        cap = getattr(msg, "message", None) or ""
+        if cap:
+            parts.append(cap)
+        return " ".join(parts).lower()
+
+    def _normalize_ar(s):
+        s = s.lower()
+        s = re.sub(r"[إأآا]", "ا", s)
+        s = re.sub(r"ى",      "ي", s)
+        s = re.sub(r"ة",      "ه", s)
+        s = re.sub(r"[ًٌٍَُِّْـ]", "", s)
+        return s
+
+    def _match_score(query, audio_text):
+        q     = _normalize_ar(query)
+        t     = _normalize_ar(audio_text)
+        words = [w for w in re.split(r"\s+", q) if len(w) >= 2]
+        if not words:
+            return 0
+        return sum(1 for w in words if w in t)
+
+    async def _forward_audio(msg, req_key):
+        req         = yoot_pending.pop(req_key, {})
+        orig_msg_id = req.get("orig_msg_id")
+        wait_msg_id = req.get("wait_msg_id")
+        src_chat_id = req.get("src_chat_id")
+        if not src_chat_id:
+            return
+
+        # إرسال البصمة نظيفة (بدون أي كابشن/رابط) ردّاً على رسالة المستخدم الأصلية
+        tmp_path = None
+        sent_ok  = False
+        try:
+            await user_client.send_file(
+                src_chat_id, file=msg, caption="",
+                voice_note=bool(getattr(msg, "voice", None)),
+                reply_to=orig_msg_id,
+            )
+            sent_ok = True
+        except Exception as e:
+            logger.warning(f"[YT] send_file direct failed: {e}")
+            try:
+                tmp_path  = await user_client.download_media(msg, file=tempfile.gettempdir())
+                audio_attr = None
+                if msg.document:
+                    for attr in msg.document.attributes:
+                        if isinstance(attr, DocumentAttributeAudio):
+                            audio_attr = attr; break
+                await user_client.send_file(
+                    src_chat_id, file=tmp_path, caption="",
+                    attributes=[audio_attr] if audio_attr else None,
+                    voice_note=False,
+                    reply_to=orig_msg_id,
+                )
+                sent_ok = True
+            except Exception as e2:
+                logger.error(f"[YT] fallback failed: {e2}")
+            finally:
+                try:
+                    if tmp_path and os.path.exists(tmp_path):
+                        os.remove(tmp_path)
+                except Exception:
+                    pass
+
+        # حذف رسالة "انتظر قليلا" بعد إرسال البصمة
+        if wait_msg_id:
+            try:
+                await user_client.delete_messages(src_chat_id, [wait_msg_id])
+            except Exception:
+                pass
+
+        if not sent_ok:
+            try:
+                await user_client.send_message(
+                    src_chat_id, "لا توجد نتائج", reply_to=orig_msg_id
+                )
+            except Exception:
+                pass
+
+    async def _handle_w60y_msg(msg):
+        if not yoot_pending or not _is_audio_msg(msg):
+            return
+        req_key = None
+
+        # 1) رد مباشر على رسالتنا
+        if msg.reply_to:
+            rid = msg.reply_to.reply_to_msg_id
+            if rid in yoot_pending:
+                req_key = rid
+
+        # 2) مطابقة بمحتوى البصمة (عنوان/أداء) مع نص الطلب
+        if req_key is None:
+            audio_txt  = _audio_text(msg)
+            best_key, best_score = None, 0
+            for k, v in yoot_pending.items():
+                sc = _match_score(v.get("query", ""), audio_txt)
+                if sc > best_score:
+                    best_key, best_score = k, sc
+            if best_key is not None:
+                req_key = best_key
+
+        # 3) أقدم طلب معلق (FIFO)
+        if req_key is None:
+            req_key = next(iter(yoot_pending), None)
+
+        if req_key is None:
+            return
+        await _forward_audio(msg, req_key)
+
+    # مستمع رد @W60yBot — يستمع للرسائل الجديدة والمعدَّلة في كروب البصمات
     @user_client.on(events.NewMessage(incoming=True))
     async def _yoot_listener(event):
         if not yoot_pending:
             return
-        msg = event.message
-        # يجب أن تكون ميديا (صوت أو ملف)
-        if not (msg.voice or msg.audio or msg.document):
+        sender = await event.get_sender()
+        if not sender:
+            return
+        if (getattr(sender, "username", "") or "").lower() != "w60ybot":
+            return
+        await _handle_w60y_msg(event.message)
+
+    @user_client.on(events.MessageEdited(incoming=True))
+    async def _yoot_listener_edit(event):
+        if not yoot_pending:
             return
         sender = await event.get_sender()
         if not sender:
             return
-        sender_username = (getattr(sender, "username", "") or "").lower()
-        if sender_username != "w60ybot":
+        if (getattr(sender, "username", "") or "").lower() != "w60ybot":
             return
-
-        # محاولة 1: مطابقة عبر reply_to_msg_id
-        reply_id = getattr(msg.reply_to, "reply_to_msg_id", None) if msg.reply_to else None
-        if reply_id and reply_id in yoot_pending:
-            src_chat_id, status_msg = yoot_pending.pop(reply_id)
-        else:
-            # محاولة 2: أخذ أول طلب معلق (FIFO) — حين يرسل W60yBot بدون رد مباشر
-            first_key = next(iter(yoot_pending), None)
-            if first_key is None:
-                return
-            src_chat_id, status_msg = yoot_pending.pop(first_key)
-
-        # نحوّل البصمة/الصوت فقط — بدون أي نص أو رابط من W60yBot
-        try:
-            if msg.voice or msg.audio:
-                await user_client.send_file(
-                    src_chat_id,
-                    msg.media,
-                    voice_note=bool(msg.voice),
-                    caption="",
-                )
-            elif msg.document:
-                await user_client.send_file(src_chat_id, msg.media, caption="")
-        except Exception as e:
-            logger.error(f"خطأ في إعادة إرسال البصمة: {e}")
-        # حذف رسالة "انتظر قليلا" فقط
-        try:
-            await status_msg.delete()
-        except Exception:
-            pass
+        await _handle_w60y_msg(event.message)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1257,7 +1367,7 @@ async def _cmd_raise_shoe(event):
 
 # ── يوت [نص] ──
 async def _cmd_yoot(event, txt: str):
-    chat_id = event.chat_id
+    chat_id    = event.chat_id
     yoot_group = cfg.get("yoot_group")
     if not yoot_group:
         await event.delete()
@@ -1270,68 +1380,97 @@ async def _cmd_yoot(event, txt: str):
         return await _ub_reply(event, "⚠️ اكتب: يوت [اسم الأغنية]")
 
     await event.delete()
-    sm = await user_client.send_message(chat_id, f"🎵 جاري البحث عن: {query}…")
+    sm = await user_client.send_message(chat_id, "⏳ انتظر قليلاً…")
 
     try:
         chat = await _get_chat(user_client, yoot_group)
         if not chat:
-            return await sm.edit("❌ لم أجد كروب البصمات.")
+            return await sm.edit("لا توجد نتائج")
         sent = await user_client.send_message(chat, f"يوت {query}")
-        yoot_pending[sent.id] = (chat_id, event)
-        # انتظر 30 ثانية كحد أقصى للرد
-        await asyncio.sleep(30)
-        if sent.id in yoot_pending:
-            yoot_pending.pop(sent.id, None)
-            await sm.edit("❌ لم يرد @W60yBot في الوقت المحدد.")
-        else:
-            await sm.delete()
+        yoot_pending[sent.id] = {
+            "query": query, "orig_msg_id": None,
+            "wait_msg_id": sm.id, "src_chat_id": chat_id,
+            "ts": time.time(),
+        }
+
+        async def _timeout(req_key):
+            await asyncio.sleep(25)
+            req = yoot_pending.pop(req_key, None)
+            if req is None:
+                return
+            wmid = req.get("wait_msg_id")
+            if wmid:
+                try:
+                    await user_client.delete_messages(chat_id, [wmid])
+                except Exception:
+                    pass
+            try:
+                await user_client.send_message(chat_id, "لا توجد نتائج")
+            except Exception:
+                pass
+
+        asyncio.create_task(_timeout(sent.id))
     except Exception as e:
-        await sm.edit(f"❌ خطأ: {e}")
+        try:
+            await sm.edit(f"❌ خطأ: {e}")
+        except Exception:
+            pass
 
 
 # ── اريد [نص] → يوت في كروب البصمات ──
 async def _cmd_arid(event, txt: str):
     """
-    عندما يكتب المستخدم "اريد [شيء]":
-    - يرد على رسالته بـ "انتظر قليلا ⏳" (لا يحذف رسالته)
+    - يرد على رسالة المستخدم بـ "انتظر قليلاً" (لا يحذفها)
     - يُرسل "يوت [شيء]" إلى كروب البصمات
-    - عند وصول البصمة يُحوِّلها للكروب الأصلي ويحذف رسالة الانتظار فقط
+    - عند وصول البصمة: تُرسَل ردّاً على رسالة المستخدم الأصلية
+      وتُحذف رسالة الانتظار فقط
+    - إذا انتهت المهلة: يقول "لا توجد نتائج"
     """
     src_chat_id = event.chat_id
-    yoot_group = cfg.get("yoot_group", "https://t.me/u33u0")
+    yoot_group  = cfg.get("yoot_group", "https://t.me/u33u0")
 
     query = txt[len("اريد "):].strip()
     if not query:
         return
 
-    # الرد على رسالة المستخدم بـ "انتظر قليلا" — لا نحذف رسالته
-    sm = await user_client.send_message(src_chat_id, "انتظر قليلا ⏳",
-                                        reply_to=event.id)
-
+    # الرد على رسالة المستخدم بـ "انتظر قليلاً" — لا نحذف رسالته
+    orig_msg_id = event.id
+    sm = await user_client.send_message(src_chat_id, "انتظر قليلاً…",
+                                        reply_to=orig_msg_id)
     try:
         chat = await _get_chat(user_client, yoot_group)
         if not chat:
-            return await sm.edit(
-                f"❌ لم أجد كروب البصمات.\n"
-                f"تأكد من تعيينه في البوت (الحالي: `{yoot_group}`)."
-            )
+            return await sm.edit("لا توجد نتائج")
 
-        # إرسال "يوت [query]" إلى كروب البصمات
         sent = await user_client.send_message(chat, f"يوت {query}")
+        yoot_pending[sent.id] = {
+            "query":        query,
+            "orig_msg_id":  orig_msg_id,
+            "wait_msg_id":  sm.id,
+            "src_chat_id":  src_chat_id,
+            "ts":           time.time(),
+        }
 
-        # تسجيل الانتظار — sm هو رسالة "انتظر قليلا" التي ستُحذف بعد إرسال البصمة
-        yoot_pending[sent.id] = (src_chat_id, sm)
+        async def _timeout(req_key):
+            await asyncio.sleep(25)
+            req = yoot_pending.pop(req_key, None)
+            if req is None:
+                return  # البصمة وصلت بنجاح
+            wmid = req.get("wait_msg_id")
+            if wmid:
+                try:
+                    await user_client.delete_messages(src_chat_id, [wmid])
+                except Exception:
+                    pass
+            try:
+                await user_client.send_message(
+                    src_chat_id, "لا توجد نتائج",
+                    reply_to=req.get("orig_msg_id"),
+                )
+            except Exception:
+                pass
 
-        # انتظر حتى 45 ثانية للرد
-        for _ in range(45):
-            await asyncio.sleep(1)
-            if sent.id not in yoot_pending:
-                # المستمع أرسل البصمة وحذف sm
-                return
-
-        # انتهى الوقت بدون رد
-        yoot_pending.pop(sent.id, None)
-        await sm.edit("❌ لم يستجب @W60yBot. جرب مرة أخرى.")
+        asyncio.create_task(_timeout(sent.id))
 
     except Exception as e:
         try:
