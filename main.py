@@ -370,19 +370,9 @@ async def join_stage_only(chat_id: int) -> bool:
 # ─────────────────────────────────────────────────────────────
 def main_menu():
     return [
-        [Button.inline("➕ إضافة حساب للاستيج",       b"login_acc")],
         [Button.inline("📱 تسجيل جلسة اليوزربوت",     b"gen_session")],
-        [Button.inline("🎵 تشغيل في الاستيج (يدوي)",  b"manual_play")],
-        [
-            Button.inline("📞 صعود اتصال",  b"call_up"),
-            Button.inline("📴 نزول اتصال",  b"call_down"),
-        ],
         [Button.inline("🎤 تعيين كروب البصمات",        b"set_yoot")],
         [Button.inline("📋 قائمة الأوامر",             b"cmd_list")],
-        [
-            Button.inline("👥 عرض الحسابات", b"show_accs"),
-            Button.inline("🗑 مسح حساب",     b"del_acc"),
-        ],
         [Button.url("👨‍💻 المطوّر", "https://t.me/c3cccc3c")],
     ]
 
@@ -489,75 +479,6 @@ async def bot_cb(event):
             buttons=[[Button.inline("❌ إلغاء", b"cancel")]],
         )
 
-    # ── إضافة حساب للاستيج ──
-    elif d == b"login_acc":
-        accs = get_saved_accounts()
-        if len(accs) >= 1:
-            await event.answer("يمكنك إضافة حساب واحد فقط. امسح الحالي أولاً.", alert=True)
-            return
-        bot_states[event.sender_id] = {"step": "acc_phone"}
-        await event.edit(
-            "أرسل رقم الهاتف للحساب:",
-            buttons=[[Button.inline("❌ إلغاء", b"cancel")]],
-        )
-
-    # ── تشغيل يدوي ──
-    elif d == b"manual_play":
-        if not get_saved_accounts():
-            await event.answer("لا يوجد حساب مضاف!", alert=True)
-            return
-        bot_states[event.sender_id] = {"step": "m_media"}
-        await event.edit(
-            "أرسل الميديا (فيديو/صوت/صوتية):",
-            buttons=[[Button.inline("❌ إلغاء", b"cancel")]],
-        )
-
-    # ── عرض الحسابات ──
-    elif d == b"show_accs":
-        accs = get_saved_accounts()
-        if not accs:
-            await event.answer("لا توجد حسابات.", alert=True)
-            return
-        txt = "**حساباتك:**\n\n"
-        for a in accs:
-            txt += f"• `{a}` — {'🔊 نشط' if active_chats else '💤 غير نشط'}\n"
-        await event.edit(txt, buttons=[[Button.inline("🔙 رجوع", b"back")]])
-
-    # ── مسح حساب ──
-    elif d == b"del_acc":
-        accs = get_saved_accounts()
-        if not accs:
-            await event.answer("لا توجد حسابات.", alert=True)
-            return
-        btns = [[Button.inline(a, f"delacc_{a}".encode())] for a in accs]
-        btns.append([Button.inline("❌ إلغاء", b"cancel")])
-        await event.edit("اختر الحساب للمسح:", buttons=btns)
-
-    elif d.startswith(b"delacc_"):
-        acc = d.decode().replace("delacc_", "")
-        path = os.path.join(SESSIONS_DIR, f"{acc}.session")
-        if os.path.exists(path):
-            os.remove(path)
-            await event.answer(f"تم مسح {acc}.", alert=True)
-        await event.edit("ok:", buttons=main_menu())
-
-    # ── صعود/نزول اتصال ──
-    elif d == b"call_up":
-        accs = get_saved_accounts()
-        if not accs:
-            await event.answer("لا يوجد حساب مضاف!", alert=True)
-            return
-        bot_states[event.sender_id] = {"step": "join_link", "phone": accs[0]}
-        await event.edit("أرسل رابط الجروب:", buttons=[[Button.inline("❌ إلغاء", b"cancel")]])
-
-    elif d == b"call_down":
-        if not active_chats:
-            await event.answer("لا توجد مكالمات نشطة.", alert=True)
-            return
-        for cid in list(active_chats.keys()):
-            await stop_in_chat(cid)
-        await event.answer("تم الإيقاف.", alert=True)
-        await event.edit("ok:", buttons=main_menu())
 
 
 @bot.on(events.NewMessage)
@@ -625,136 +546,6 @@ async def bot_msgs(event):
             await event.respond(f"✅ تم تعيين كروب البصمات: `{val}`", buttons=main_menu())
         bot_states.pop(event.sender_id, None)
 
-    # ════ إضافة حساب للاستيج ════
-    elif step == "acc_phone":
-        phone = (event.text or "").strip()
-        sess = os.path.join(SESSIONS_DIR, phone)
-        tmp = TelegramClient(sess, API_ID, API_HASH)
-        await tmp.connect()
-        try:
-            r = await tmp.send_code_request(phone)
-            bot_states[event.sender_id] = {"step": "acc_code", "phone": phone,
-                                            "hash": r.phone_code_hash, "client": tmp}
-            await event.respond(f"أرسل الكود لـ `{phone}`:",
-                                 buttons=[[Button.inline("❌ إلغاء", b"cancel")]])
-        except Exception as e:
-            await event.respond(f"خطأ: {e}", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-            await tmp.disconnect()
-
-    elif step == "acc_code":
-        code = (event.text or "").replace(".", "").replace(" ", "").strip()
-        tmp: TelegramClient = state["client"]
-        try:
-            await tmp.sign_in(state["phone"], code, phone_code_hash=state["hash"])
-            await event.respond(f"✅ تم حفظ `{state['phone']}`.", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-            await tmp.disconnect()
-        except SessionPasswordNeededError:
-            bot_states[event.sender_id]["step"] = "acc_2fa"
-            await event.respond("🔐 أرسل كلمة المرور:")
-        except PhoneCodeInvalidError:
-            await event.respond("كود خاطئ، أعد:")
-        except Exception as e:
-            await event.respond(f"خطأ: {e}", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-
-    elif step == "acc_2fa":
-        tmp: TelegramClient = state["client"]
-        try:
-            await tmp.sign_in(password=(event.text or "").strip())
-            await event.respond(f"✅ تم حفظ `{state['phone']}`.", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-            await tmp.disconnect()
-        except PasswordHashInvalidError:
-            await event.respond("كلمة مرور خاطئة:")
-        except Exception as e:
-            await event.respond(f"خطأ: {e}", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-
-    # ════ تشغيل يدوي ════
-    elif step == "m_media":
-        has = event.message.video or event.message.document or \
-              event.message.voice or event.message.audio
-        if not has:
-            await event.respond("أرسل فيديو أو ملف صوتي.")
-            return
-        sm = await event.respond("⬇️ جاري التحميل…")
-        try:
-            r = await fast_download(event.message, sm, client=bot)
-            if not r:
-                raise Exception("تعذّر الاستخراج")
-            fp, iv = r
-            bot_states[event.sender_id] = {"step": "m_link", "path": fp, "is_video": iv}
-            await sm.delete()
-            await event.respond("✅ تم! أرسل رابط الجروب:",
-                                 buttons=[[Button.inline("❌ إلغاء", b"cancel")]])
-        except Exception as e:
-            await sm.delete()
-            await event.respond(f"خطأ: {e}", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-
-    elif step == "m_link":
-        link = (event.text or "").strip()
-        if not link:
-            return
-        accs = get_saved_accounts()
-        if not accs:
-            await event.respond("لا يوجد حساب!", buttons=main_menu())
-            bot_states.pop(event.sender_id, None)
-            return
-        sm = await event.respond("⏳ جاري الصعود والتشغيل…")
-        phone = accs[0]
-        sess = os.path.join(SESSIONS_DIR, phone)
-        try:
-            mc = TelegramClient(sess, API_ID, API_HASH, receive_updates=False)
-            await mc.connect()
-            chat = await _get_chat(mc, link)
-            if not chat:
-                raise Exception("لم أجد الجروب")
-            cid = utils.get_peer_id(chat)
-            cm = PyTgCalls(mc)
-            await cm.start()
-            fp, iv = state["path"], state["is_video"]
-            stream = (MediaStream(fp, audio_parameters=AudioQuality.STUDIO,
-                                  video_parameters=VideoQuality.FHD_1080p)
-                      if iv else MediaStream(fp, audio_parameters=AudioQuality.STUDIO))
-            await cm.play(cid, stream)
-            active_chats[cid] = cm
-            await sm.delete()
-            await event.respond("✅ يُشغَّل الآن!", buttons=main_menu())
-        except Exception as e:
-            await sm.delete()
-            await event.respond(f"فشل: {e}", buttons=main_menu())
-        bot_states.pop(event.sender_id, None)
-
-    # ════ صعود اتصال ════
-    elif step == "join_link":
-        link = (event.text or "").strip()
-        phone = state["phone"]
-        sm = await event.respond("⏳ جاري الصعود…")
-        try:
-            mc = TelegramClient(os.path.join(SESSIONS_DIR, phone), API_ID, API_HASH,
-                                 receive_updates=False)
-            await mc.connect()
-            chat = await _get_chat(mc, link)
-            if not chat:
-                raise Exception("لم أجد الجروب")
-            cid = utils.get_peer_id(chat)
-            cm = PyTgCalls(mc)
-            await cm.start()
-            await cm.play(
-                cid,
-                MediaStream("http://docs.evostream.com/sample_content/assets/sintel.mp4",
-                             audio_parameters=AudioQuality.STUDIO),
-            )
-            active_chats[cid] = cm
-            await sm.delete()
-            await event.respond("✅ تم الصعود!", buttons=main_menu())
-        except Exception as e:
-            await sm.delete()
-            await event.respond(f"فشل: {e}", buttons=main_menu())
-        bot_states.pop(event.sender_id, None)
 
 
 async def _finish_session_gen(event, tmp: TelegramClient, phone: str):
@@ -814,6 +605,14 @@ def _register_ub_handlers():
         # ── ضف صورة ──
         elif txt == "ضف صورة":
             await _cmd_add_photo(event)
+
+        # ── قفل الدردشة (أرشفة) ──
+        elif txt == "قفل":
+            await _cmd_lock_chat(event)
+
+        # ── فتح الدردشة (إلغاء الأرشفة) ──
+        elif txt == "فتح":
+            await _cmd_unlock_chat(event)
 
         # ── خروج من الجميع ──
         elif txt == "خروج من الجميع":
@@ -881,30 +680,41 @@ def _register_ub_handlers():
         if not yoot_pending:
             return
         msg = event.message
+        # يجب أن تكون ميديا (صوت أو ملف)
+        if not (msg.voice or msg.audio or msg.document):
+            return
         sender = await event.get_sender()
         if not sender:
             return
         sender_username = (getattr(sender, "username", "") or "").lower()
         if sender_username != "w60ybot":
             return
-        # نتحقق أنه رد على رسالتنا
+
+        # محاولة 1: مطابقة عبر reply_to_msg_id
         reply_id = getattr(msg.reply_to, "reply_to_msg_id", None) if msg.reply_to else None
-        if not reply_id or reply_id not in yoot_pending:
-            return
-        src_chat_id, status_msg = yoot_pending.pop(reply_id)
-        # نحوّل البصمة/الصوت فقط — بدون نص أو روابط إضافية
+        if reply_id and reply_id in yoot_pending:
+            src_chat_id, status_msg = yoot_pending.pop(reply_id)
+        else:
+            # محاولة 2: أخذ أول طلب معلق (FIFO) — حين يرسل W60yBot بدون رد مباشر
+            first_key = next(iter(yoot_pending), None)
+            if first_key is None:
+                return
+            src_chat_id, status_msg = yoot_pending.pop(first_key)
+
+        # نحوّل البصمة/الصوت فقط — بدون أي نص أو رابط من W60yBot
         try:
             if msg.voice or msg.audio:
                 await user_client.send_file(
                     src_chat_id,
                     msg.media,
                     voice_note=bool(msg.voice),
+                    caption="",
                 )
             elif msg.document:
-                await user_client.send_file(src_chat_id, msg.media)
+                await user_client.send_file(src_chat_id, msg.media, caption="")
         except Exception as e:
             logger.error(f"خطأ في إعادة إرسال البصمة: {e}")
-        # حذف رسالة "جاري البحث"
+        # حذف رسالة "انتظر قليلا" فقط
         try:
             await status_msg.delete()
         except Exception:
@@ -1111,6 +921,38 @@ async def _cmd_leave_all(event):
     await sm.edit(
         f"✅ **تم الخروج**\n\n• خرج من: **{left}**\n• تجاوز (مشرف/حالي): **{skipped}**"
     )
+
+
+# ── قفل الدردشة (أرشفة في الخاص) ──
+async def _cmd_lock_chat(event):
+    chat_id = event.chat_id
+    await event.delete()
+    if not event.is_private:
+        return await _ub_reply(event, "⚠️ هذا الأمر للدردشات الخاصة فقط.")
+    try:
+        peer = await user_client.get_input_entity(chat_id)
+        await user_client(functions.folders.EditPeerFoldersRequest(
+            folder_peers=[types.InputFolderPeer(peer=peer, folder_id=1)]
+        ))
+        await _ub_reply(event, "🔒 تم قفل (أرشفة) الدردشة.", delay=4)
+    except Exception as e:
+        await _ub_reply(event, f"❌ فشل القفل: {e}")
+
+
+# ── فتح الدردشة (إلغاء الأرشفة) ──
+async def _cmd_unlock_chat(event):
+    chat_id = event.chat_id
+    await event.delete()
+    if not event.is_private:
+        return await _ub_reply(event, "⚠️ هذا الأمر للدردشات الخاصة فقط.")
+    try:
+        peer = await user_client.get_input_entity(chat_id)
+        await user_client(functions.folders.EditPeerFoldersRequest(
+            folder_peers=[types.InputFolderPeer(peer=peer, folder_id=0)]
+        ))
+        await _ub_reply(event, "🔓 تم فتح الدردشة.", delay=4)
+    except Exception as e:
+        await _ub_reply(event, f"❌ فشل الفتح: {e}")
 
 
 # ── تقليد ──
@@ -1335,14 +1177,18 @@ async def _cmd_info(event, txt: str):
         await sm.edit(f"❌ فشل: {e}")
 
 
-# ── تحويل (forward) ──
+# ── تحويل (re-send بدون هيدر التمرير) ──
 async def _cmd_forward_media(event):
     replied = await event.get_reply_message()
     await event.delete()
     if not replied:
         return await _ub_reply(event, "⚠️ رُدّ على رسالة/ميديا لتحويلها.")
     try:
-        await user_client.forward_messages(event.chat_id, replied)
+        if replied.media:
+            caption = replied.text or ""
+            await user_client.send_file(event.chat_id, replied.media, caption=caption)
+        elif replied.text:
+            await user_client.send_message(event.chat_id, replied.text)
     except Exception as e:
         await _ub_reply(event, f"❌ فشل التحويل: {e}")
 
@@ -1378,13 +1224,16 @@ async def _cmd_raise_camel(event):
     replied = await event.get_reply_message()
     await event.delete()
     name = ""
+    reply_to_id = None
     if replied:
         sender = await replied.get_sender()
         name = (getattr(sender, "first_name", "") or "المستخدم") if sender else "المستخدم"
+        reply_to_id = replied.id
     await user_client.send_message(
         event.chat_id,
         f"🐪 تم رفع {name} إلى مطي أصيل بامتياز! 🐪😂\n"
-        f"مبروك التكريم العالي يا صاحب المطي العتيد! 🏆🐫"
+        f"مبروك التكريم العالي يا صاحب المطي العتيد! 🏆🐫",
+        reply_to=reply_to_id,
     )
 
 
@@ -1393,13 +1242,16 @@ async def _cmd_raise_shoe(event):
     replied = await event.get_reply_message()
     await event.delete()
     name = ""
+    reply_to_id = None
     if replied:
         sender = await replied.get_sender()
         name = (getattr(sender, "first_name", "") or "المستخدم") if sender else "المستخدم"
+        reply_to_id = replied.id
     await user_client.send_message(
         event.chat_id,
         f"👟 تم رفع {name} إلى رتبة قندرة عتيگة من الدرجة الأولى! 😂👟\n"
-        f"مبروك هذا الشرف الرفيع يا صاحب القندرة المحترمة! 🏅"
+        f"مبروك هذا الشرف الرفيع يا صاحب القندرة المحترمة! 🏅",
+        reply_to=reply_to_id,
     )
 
 
@@ -1440,22 +1292,21 @@ async def _cmd_yoot(event, txt: str):
 # ── اريد [نص] → يوت في كروب البصمات ──
 async def _cmd_arid(event, txt: str):
     """
-    عندما يكتب المستخدم "اريد [شيء]" في أي مجموعة:
-    - يُرسل "يوت [شيء]" إلى كروب البصمات (u33u0)
-    - ينتظر رد @W60yBot بالبصمة الصوتية
-    - يُحوِّل البصمة إلى المجموعة الأصلية بدون روابط أو يوزر إضافي
+    عندما يكتب المستخدم "اريد [شيء]":
+    - يرد على رسالته بـ "انتظر قليلا ⏳" (لا يحذف رسالته)
+    - يُرسل "يوت [شيء]" إلى كروب البصمات
+    - عند وصول البصمة يُحوِّلها للكروب الأصلي ويحذف رسالة الانتظار فقط
     """
     src_chat_id = event.chat_id
     yoot_group = cfg.get("yoot_group", "https://t.me/u33u0")
 
     query = txt[len("اريد "):].strip()
     if not query:
-        return  # لا نفعل شيئاً إذا كانت الرسالة "اريد" فقط
+        return
 
-    # حذف رسالة المستخدم الأصلية
-    await event.delete()
-
-    sm = await user_client.send_message(src_chat_id, "انتظر قليلا ⏳")
+    # الرد على رسالة المستخدم بـ "انتظر قليلا" — لا نحذف رسالته
+    sm = await user_client.send_message(src_chat_id, "انتظر قليلا ⏳",
+                                        reply_to=event.id)
 
     try:
         chat = await _get_chat(user_client, yoot_group)
@@ -1468,18 +1319,14 @@ async def _cmd_arid(event, txt: str):
         # إرسال "يوت [query]" إلى كروب البصمات
         sent = await user_client.send_message(chat, f"يوت {query}")
 
-        # تسجيل الانتظار
+        # تسجيل الانتظار — sm هو رسالة "انتظر قليلا" التي ستُحذف بعد إرسال البصمة
         yoot_pending[sent.id] = (src_chat_id, sm)
 
-        # انتظر حتى 40 ثانية للرد
-        for _ in range(40):
+        # انتظر حتى 45 ثانية للرد
+        for _ in range(45):
             await asyncio.sleep(1)
             if sent.id not in yoot_pending:
-                # تم استلام الرد وتحويله في المستمع
-                try:
-                    await sm.delete()
-                except Exception:
-                    pass
+                # المستمع أرسل البصمة وحذف sm
                 return
 
         # انتهى الوقت بدون رد
