@@ -22,6 +22,7 @@ from telethon.errors import (
     ChatAdminRequiredError,
     UserNotParticipantError,
     FloodWaitError,
+    AuthKeyDuplicatedError,
 )
 
 try:
@@ -1608,6 +1609,36 @@ async def main():
                 call_manager = PyTgCalls(user_client)
                 await call_manager.start()
                 logger.info("✅ مدير الاستيج جاهز")
+        except AuthKeyDuplicatedError:
+            # الجلسة تعمل من مكانين في نفس الوقت — احذف الملف المحلي وأبلغ المالك
+            logger.error("❌ AuthKeyDuplicatedError: الجلسة مكررة، سيتم حذف الجلسة المحفوظة")
+            # حذف الجلسة المحفوظة محلياً
+            for f in [SESSION_STRING_FILE, USER_SESSION + ".session"]:
+                try:
+                    if os.path.exists(f):
+                        os.remove(f)
+                except Exception:
+                    pass
+            try:
+                await user_client.disconnect()
+            except Exception:
+                pass
+            user_client = None
+            # إبلاغ المالك برسالة عبر البوت
+            try:
+                await bot.send_message(
+                    OWNER_ID,
+                    "⚠️ **مشكلة في جلسة اليوزربوت**\n\n"
+                    "الخطأ: `AuthKeyDuplicatedError`\n"
+                    "السبب: الجلسة تعمل من مكانين في نفس الوقت "
+                    "(مثلاً: run قديم في GitHub Actions لم ينته بعد).\n\n"
+                    "**الحل:**\n"
+                    "1️⃣ تأكد أن workflow قديم لا يزال يعمل وأوقفه.\n"
+                    "2️⃣ ثم سجّل جلسة جديدة من هذه القائمة 👇",
+                    buttons=main_menu(),
+                )
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"فشل تشغيل اليوزربوت: {e}")
             user_client = None
